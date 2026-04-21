@@ -1,21 +1,23 @@
 """
-UPI PQC SERVER — FINAL YEAR PROJECT EDITION
-============================================
+UPI PQC SERVER — FINAL YEAR PROJECT EDITION (OFFLINE-SAFE)
+==========================================================
 Run:   python3 2_server.py
 Hosts: http://0.0.0.0:5000
 
-FIXES:
- - QR scan now works via image upload (no camera needed on same laptop)
- - Camera scan kept as optional fallback
- - 2-account demo: open two browser tabs, log in as different users, pay each other
- - Auto-login via QR: scan QR with phone → opens site logged in as that user
- - FIXED: upi:// URL parsing on mobile (upi:// scheme not recognized by URL constructor)
- - FIXED: tab switching uses text-match not fragile index
- - FIXED: camera no longer fires handleScannedCode multiple times
+REQUIREMENTS FOR OFFLINE/VIVA USE:
+ - Place jsQR.min.js in the SAME folder as this script
+ - No internet needed — jsQR is served locally at /jsQR.min.js
+
+FIXES IN THIS VERSION:
+ - jsQR served locally (no CDN dependency — works offline at viva)
+ - Camera: downscale frames to 640px, attemptBoth inversions, playsinline fixed
+ - Camera: re-entry guard so scan fires only once per QR
+ - Upload: better error messages, no "jsQR not loaded" issue
+ - Removed unused qrcodejs CDN script
 """
 
 import os, time, hashlib, hmac as hmaclib, sqlite3, uuid, secrets, base64, io
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory, abort
 
 # ── PQC BACKEND ───────────────────────────────────────────────────────────────
 try:
@@ -37,8 +39,10 @@ except ImportError:
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ── SQLITE ────────────────────────────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transactions.db")
+DB_PATH = os.path.join(SCRIPT_DIR, "transactions.db")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -405,7 +409,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
        <div id="scan-camera-mode" style="display:none">
          <button onclick="startScan()" id="scan-btn">[ START CAMERA ]</button>
          <button onclick="stopScan()" id="stop-btn" style="display:none;border-color:#dc2626;color:#dc2626;background:#fef2f2">[ STOP CAMERA ]</button>
-         <video id="qr-video" autoplay playsinline style="margin-top:12px"></video>
+         <video id="qr-video" autoplay playsinline muted style="margin-top:12px"></video>
          <canvas id="qr-canvas" style="display:none"></canvas>
        </div>
 
@@ -594,15 +598,15 @@ button:disabled{opacity:0.4;cursor:not-allowed}
  </div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<!-- jsQR loaded locally — no CDN dependency -->
+<script src="/jsQR.min.js"></script>
 <script>
 // ── STATE ──────────────────────────────────────────────────────────────────
 let AUTH_TOKEN  = localStorage.getItem('upi_token') || null;
 let AUTH_VPA    = localStorage.getItem('upi_vpa')   || null;
 let scanStream  = null;
 let scanLoop    = null;
-let scannedData = null;
+let scanBusy    = false;   // re-entry guard for camera
 
 const log = document.getElementById('log');
 function addLog(msg,cls='srv'){
@@ -773,10 +777,17 @@ function switchScanMode(mode){
   document.getElementById('scan-status').textContent='';
 }
 
-// ── QR UPLOAD SCAN ─────────────────────────────────────────────────────────
+// ── QR UPLOAD SCAN (FIXED) ─────────────────────────────────────────────────
 function handleQRUpload(event){
   const file = event.target.files[0];
   if(!file) return;
+
+  if(typeof jsQR === 'undefined'){
+    document.getElementById('scan-status').textContent =
+      '❌ jsQR not loaded. Check that jsQR.min.js is in the same folder as 2_server.py.';
+    return;
+  }
+
   document.getElementById('scan-status').textContent='Decoding QR...';
   document.getElementById('scan-result').style.display='none';
 
@@ -787,67 +798,117 @@ function handleQRUpload(event){
 
     const img = new Image();
     img.onload = function(){
+      // Downscale if huge — jsQR works fine on ~800px max side
+      const MAX = 1000;
+      let w = img.width, h = img.height;
+      if(w > MAX || h > MAX){
+        const scale = MAX / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+
       const canvas = document.getElementById('qr-decode-canvas');
-      canvas.width  = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      if(typeof jsQR === 'undefined'){
-        document.getElementById('scan-status').textContent='jsQR not loaded — refresh the page.';
+      canvas.width  = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, w, h);
+
+      let imageData;
+      try {
+        imageData = ctx.getImageData(0, 0, w, h);
+      } catch(err){
+        document.getElementById('scan-status').textContent = '❌ Could not read image data: ' + err.message;
         return;
       }
-      const code = jsQR(imageData.data, imageData.width, imageData.height);
-      if(code){
+
+      // Try both inversions — much higher success rate
+      const code = jsQR(imageData.data, w, h, { inversionAttempts: 'attemptBoth' });
+
+      if(code && code.data){
         handleScannedCode(code.data);
       } else {
-        document.getElementById('scan-status').textContent='❌ No QR code found in image. Try a clearer/larger image.';
+        document.getElementById('scan-status').textContent =
+          '❌ No QR code found in image. Try a clearer/larger image, or generate one using the left panel.';
       }
     };
+    img.onerror = function(){
+      document.getElementById('scan-status').textContent = '❌ Could not load image file.';
+    };
     img.src = e.target.result;
+  };
+  reader.onerror = function(){
+    document.getElementById('scan-status').textContent = '❌ Could not read file.';
   };
   reader.readAsDataURL(file);
 }
 
-// ── QR CAMERA SCAN ─────────────────────────────────────────────────────────
+// ── QR CAMERA SCAN (FIXED) ─────────────────────────────────────────────────
 async function startScan(){
   document.getElementById('scan-result').style.display='none';
   document.getElementById('scan-status').textContent='Starting camera...';
+  scanBusy = false;
+
+  if(typeof jsQR === 'undefined'){
+    document.getElementById('scan-status').textContent =
+      '❌ jsQR not loaded. Check that jsQR.min.js is in the same folder as 2_server.py.';
+    return;
+  }
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    document.getElementById('scan-status').textContent =
+      '❌ Camera API unavailable. On phones you need HTTPS or use localhost. Try UPLOAD IMAGE mode instead.';
+    return;
+  }
 
   try{
     scanStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment' }
+      video: {
+        facingMode: 'environment',
+        width:  { ideal: 1280 },
+        height: { ideal: 720 }
+      }
     });
 
-    const video = document.getElementById('qr-video');
+    const video  = document.getElementById('qr-video');
+    const canvas = document.getElementById('qr-canvas');
+    const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+
     video.srcObject = scanStream;
-    video.setAttribute("playsinline", true);
-    video.setAttribute("autoplay", true);
+    video.setAttribute('playsinline', '');   // empty string, not boolean
     video.muted = true;
     await video.play();
 
     video.style.display = 'block';
     document.getElementById('scan-btn').style.display = 'none';
     document.getElementById('stop-btn').style.display = '';
-    document.getElementById('scan-status').textContent = 'Camera active — point at QR code';
+    document.getElementById('scan-status').textContent = 'Camera active — point steadily at QR code';
 
-    const canvas = document.getElementById('qr-canvas');
-    const ctx = canvas.getContext('2d');
+    const TARGET_W = 640;   // downscaled frame — ~4x faster decode
 
     scanLoop = setInterval(()=>{
+      if(!scanStream || scanBusy) return;
       if(video.readyState !== video.HAVE_ENOUGH_DATA) return;
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      if(!video.videoWidth || !video.videoHeight) return;
+
+      const scale  = TARGET_W / video.videoWidth;
+      canvas.width = TARGET_W;
+      canvas.height = Math.floor(video.videoHeight * scale);
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      if(typeof jsQR === 'undefined') return;
+
+      let imageData;
+      try {
+        imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      } catch(e){ return; }
+
       const code = jsQR(imageData.data, canvas.width, canvas.height, {
-        inversionAttempts: "dontInvert"
+        inversionAttempts: 'attemptBoth'
       });
-      if(code){
+
+      if(code && code.data){
+        scanBusy = true;             // lock until stopScan completes
         handleScannedCode(code.data);
       }
-    }, 150);
+    }, 120);
 
   } catch(e){
     document.getElementById('scan-status').textContent = 'Camera error: ' + e.message;
@@ -855,12 +916,15 @@ async function startScan(){
 }
 
 function stopScan(){
+  scanBusy = true;
   if(scanLoop){ clearInterval(scanLoop); scanLoop = null; }
   if(scanStream){ scanStream.getTracks().forEach(t => t.stop()); scanStream = null; }
   const video = document.getElementById('qr-video');
-  if(video) video.style.display = 'none';
-  document.getElementById('scan-btn').style.display = '';
-  document.getElementById('stop-btn').style.display = 'none';
+  if(video){ video.style.display = 'none'; video.srcObject = null; }
+  const btn = document.getElementById('scan-btn');
+  const stop = document.getElementById('stop-btn');
+  if(btn)  btn.style.display  = '';
+  if(stop) stop.style.display = 'none';
 }
 
 // ── PARSE QR DATA ──────────────────────────────────────────────────────────
@@ -874,7 +938,6 @@ function parseQRData(data){
     remarks = parts[3] || '';
   } else if(data.startsWith('upi://')){
     try{
-      // upi:// is not a standard scheme — replace so URL constructor works
       const url = new URL(data.replace('upi://', 'https://upi/'));
       vpa     = url.searchParams.get('pa') || '';
       amount  = url.searchParams.get('am') || '';
@@ -898,7 +961,6 @@ function goToPayTab(){
     const el = document.getElementById('tab-'+t);
     if(el) el.style.display = (t==='pay') ? '' : 'none';
   });
-  // match by text content — robust even if nav order changes
   document.querySelectorAll('nav a').forEach(a=>{
     a.classList.remove('active');
     if(a.textContent.trim() === 'PAYMENT') a.classList.add('active');
@@ -907,45 +969,33 @@ function goToPayTab(){
 
 // ── MAIN QR SCAN HANDLER ───────────────────────────────────────────────────
 function handleScannedCode(data){
-  // stop camera immediately so this doesn't fire multiple times
   stopScan();
-
   data = data.trim();
   window.lastQRData = data;
 
   document.getElementById('scan-status').textContent = '✓ QR decoded!';
 
-  // Case 1: plain HTTP/HTTPS link (e.g. auto-login QR) → navigate directly
   if(data.startsWith('https://') || data.startsWith('http://')){
     window.location.href = data;
     return;
   }
 
-  // Case 2: UPI PQC custom format or standard upi:// deep link
   const isUPIPQC = data.startsWith('UPI_PQC|');
   const isUPILink = data.startsWith('upi://');
 
   if(isUPIPQC || isUPILink){
     const { vpa, amount, remarks } = parseQRData(data);
-
-    // Fill payment form fields
     if(vpa)     document.getElementById('receiver').value = vpa;
     if(amount)  document.getElementById('amount').value   = amount;
     if(remarks) document.getElementById('remarks').value  = remarks;
-
-    // Switch to Payment tab
     goToPayTab();
-
     addLog(`[QR] Scanned → receiver=${vpa || '?'}${amount ? '  ₹'+amount : ''}`, 'pqc');
-
-    // Prompt login if not authenticated
     if(!AUTH_TOKEN){
       setTimeout(()=> showModal('login'), 300);
     }
     return;
   }
 
-  // Case 3: fallback — show decoded result panel with manual apply button
   const { vpa, amount, remarks } = parseQRData(data);
   document.getElementById('scan-decoded').innerHTML = `
     <div>VPA: <strong style="color:#166534">${vpa || data}</strong></div>
@@ -1191,6 +1241,20 @@ updateAuthBar();
 </body>
 </html>"""
 
+# ── ROUTE: serve jsQR locally (no CDN needed) ────────────────────────────────
+@app.route("/jsQR.min.js")
+def serve_jsqr():
+    path = os.path.join(SCRIPT_DIR, "jsQR.min.js")
+    if not os.path.exists(path):
+        return (
+            "// ERROR: jsQR.min.js is missing from the project folder.\n"
+            "// Please download it from https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js\n"
+            "// and place it next to 2_server.py\n",
+            404,
+            {"Content-Type": "application/javascript"}
+        )
+    return send_from_directory(SCRIPT_DIR, "jsQR.min.js", mimetype="application/javascript")
+
 # ── ROUTES — AUTH ─────────────────────────────────────────────────────────────
 @app.route("/api/register", methods=["POST"])
 def api_register():
@@ -1241,15 +1305,12 @@ def api_qr_generate():
         vpa     = data.get("vpa","").strip()
         amount  = data.get("amount","0")
         remarks = data.get("remarks","")
-        fmt     = data.get("format","app")  # 'app' = UPI_PQC custom, 'upi' = standard upi://
+        fmt     = data.get("format","app")
 
         if fmt == "app":
-            # Custom format — only this app's camera understands it
-            # The OS will NOT intercept it with GPay/PhonePe
             qr_data  = f"UPI_PQC|{vpa}|{amount}|{remarks}"
             upi_link = qr_data
         else:
-            # Standard upi:// deep link — opens GPay, PhonePe etc.
             upi_link = f"upi://pay?pa={vpa}&pn={vpa.split('@')[0].title()}"
             if amount and float(amount) > 0:
                 upi_link += f"&am={amount}"
@@ -1525,7 +1586,7 @@ def api_attack():
 @app.route("/api/qiskit_shor")
 def api_qiskit_shor():
     try:
-        import matha
+        import math
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
@@ -1605,6 +1666,15 @@ def api_qiskit_shor():
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
+    # Warn if jsQR is missing
+    jsqr_path = os.path.join(SCRIPT_DIR, "jsQR.min.js")
+    if not os.path.exists(jsqr_path):
+        print("[SERVER] ⚠  WARNING: jsQR.min.js NOT FOUND next to this script.")
+        print("[SERVER]    QR scanning will fail. Download from:")
+        print("[SERVER]    https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js")
+        print("[SERVER]    and save it as jsQR.min.js next to 2_server.py")
+    else:
+        print(f"[SERVER] ✓  jsQR.min.js found ({os.path.getsize(jsqr_path)//1024} KB)")
     print(f"[SERVER] http://0.0.0.0:{port}  |  {PQC_LIB}")
     print(f"[SERVER] Local: http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
